@@ -12,6 +12,12 @@
  *  3. Total - how much we can store across many keys (books will be stored
  *     as several keys, so this is the number that matters most).
  *
+ * Finding (iPhone 17 Pro, 2026-11-25): capacity isn't a limit (32 MB+ single,
+ * 48 MB+ total, survives force-quit), BUT the iOS Pebble app backs localStorage
+ * with NSUserDefaults - localStorage.key() lists system preference keys. That
+ * plist is loaded whole at launch and rewritten on save, so keep stored book
+ * data small and namespace every key.
+ *
  * Every test key is removed afterwards. Sizes are in characters; book text
  * is almost all ASCII, so characters is roughly bytes of book.
  */
@@ -103,6 +109,7 @@ function testTotal() {
     var v = localStorage.getItem(PREFIX + 'block_' + i);
     if (v !== null && v.length === BLOCK) intact++;
   }
+  for (var r = 0; r < count + 1; r++) localStorage.removeItem(PREFIX + 'block_' + r);
   cleanup();
   return {
     total: intact * BLOCK,
@@ -152,4 +159,29 @@ function run() {
   return summary;
 }
 
-module.exports = { run: run };
+// Remove every probe key, including the marker and the 8 MB value.
+// Deletes by explicit name too, because key enumeration (localStorage.key /
+// length) may not be supported by every PebbleKit JS host.
+// Keeps the small kami_storage_result summary for reference.
+function purge() {
+  var names = [MARKER_KEY, BIG_KEY, PREFIX + 'single'];
+  for (var b = 0; b * BLOCK < TOTAL_MAX + BLOCK; b++) names.push(PREFIX + 'block_' + b);
+  var listed = 0;
+  try {
+    for (var i = 0; i < localStorage.length; i++) {
+      var k = localStorage.key(i);
+      if (k && k.indexOf(PREFIX) === 0) { names.push(k); listed++; }
+    }
+  } catch (e) {}
+  var removed = 0;
+  for (var j = 0; j < names.length; j++) {
+    if (localStorage.getItem(names[j]) !== null) {
+      localStorage.removeItem(names[j]);
+      removed++;
+    }
+  }
+  log('purge: localStorage.length=' + localStorage.length + ', enumerated ' + listed +
+      ' probe key(s), removed ' + removed);
+}
+
+module.exports = { run: run, purge: purge };

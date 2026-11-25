@@ -15,10 +15,12 @@ var CMD_LIBRARY = 3;
 // its AppMessage inbox is 2048 bytes, so leave headroom for the dictionary.
 var CHUNK_BYTES = 1500;
 
-// Milestone 3 prep: measure phone-side storage on launch (see storage_test.js).
-// Blocks the JS thread while running, so the watch may show
-// "Couldn't reach phone" until it finishes - press select to retry.
-var RUN_STORAGE_TEST = true;
+// Measure phone-side storage on launch (see storage_test.js). Blocks the JS
+// thread while running, so the watch may show "Couldn't reach phone" until it
+// finishes - press select to retry. When off, leftover probe data is removed.
+// iPhone 17 Pro result (2026-11-25): 32 MB+ single value, 48 MB+ total,
+// ~65 MB/s writes, survives a full Pebble app force-quit.
+var RUN_STORAGE_TEST = false;
 
 // ---- Text preparation ------------------------------------------------------
 
@@ -146,6 +148,15 @@ Pebble.addEventListener('ready', function() {
   console.log('Kami JS ready');
   if (RUN_STORAGE_TEST) {
     setTimeout(function() { require('./storage_test').run(); }, 1000);
+  } else {
+    setTimeout(function() {
+      console.log('Purging storage probe data');
+      try {
+        require('./storage_test').purge();
+      } catch (err) {
+        console.log('Storage purge failed: ' + err);
+      }
+    }, 1000);
   }
 });
 
