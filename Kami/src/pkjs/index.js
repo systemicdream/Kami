@@ -15,6 +15,11 @@ var CMD_LIBRARY = 3;
 // its AppMessage inbox is 2048 bytes, so leave headroom for the dictionary.
 var CHUNK_BYTES = 1500;
 
+// Milestone 3 prep: measure phone-side storage on launch (see storage_test.js).
+// Blocks the JS thread while running, so the watch may show
+// "Couldn't reach phone" until it finishes - press select to retry.
+var RUN_STORAGE_TEST = true;
+
 // ---- Text preparation ------------------------------------------------------
 
 // Pebble system fonts cover ASCII and Latin-1 but not typographic
@@ -139,6 +144,9 @@ function sendChunk(bookId, chunkIndex) {
 
 Pebble.addEventListener('ready', function() {
   console.log('Kami JS ready');
+  if (RUN_STORAGE_TEST) {
+    setTimeout(function() { require('./storage_test').run(); }, 1000);
+  }
 });
 
 Pebble.addEventListener('appmessage', function(e) {
