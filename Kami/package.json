@@ -1,0 +1,35 @@
+{
+  "name": "Kami",
+  "author": "MakeAwesomeHappen",
+  "version": "1.0.0",
+  "keywords": ["pebble-app"],
+  "private": true,
+  "dependencies": {},
+  "pebble": {
+    "displayName": "Kami",
+    "uuid": "7b7c5076-4587-4976-8e7e-345a9fa1e2f4",
+    "sdkVersion": "3",
+    "enableMultiJS": true,
+    "targetPlatforms": [
+      "aplite",
+      "basalt",
+      "chalk",
+      "diorite",
+      "emery"
+    ],
+    "watchapp": {
+      "watchface": false
+    },
+    "messageKeys": {
+      "KEY_CMD": 0,
+      "KEY_BOOK_ID": 1,
+      "KEY_CHUNK_INDEX": 2,
+      "KEY_CHUNK_DATA": 3,
+      "KEY_CHUNK_TOTAL": 4,
+      "KEY_LIBRARY_DATA": 5
+    },
+    "resources": {
+      "media": []
+    }
+  }
+}

@@ -1,0 +1,7 @@
+.DS_Store
+
+# Pebble build output
+build/
+Kami/build/
+.lock-waf*
+
