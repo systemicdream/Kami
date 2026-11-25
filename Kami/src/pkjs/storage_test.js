@@ -19,6 +19,8 @@
 var PREFIX = 'kami_probe_';
 var MARKER_KEY = 'kami_probe_marker';
 var RESULT_KEY = 'kami_storage_result';
+var BIG_KEY = 'kami_probe_big';      // large value kept across launches
+var BIG_SIZE = 8 * 1024 * 1024;
 
 var KB = 1024;
 var MB = 1024 * KB;
@@ -58,7 +60,7 @@ function cleanup() {
   var keys = [];
   for (var i = 0; i < localStorage.length; i++) {
     var k = localStorage.key(i);
-    if (k && k.indexOf(PREFIX) === 0 && k !== MARKER_KEY) keys.push(k);
+    if (k && k.indexOf(PREFIX) === 0 && k !== MARKER_KEY && k !== BIG_KEY) keys.push(k);
   }
   for (var j = 0; j < keys.length; j++) localStorage.removeItem(keys[j]);
 }
@@ -119,6 +121,11 @@ function run() {
   var persistence = marker ? 'yes (written ' + marker + ')' : 'unknown - first run, relaunch to check';
   localStorage.setItem(MARKER_KEY, new Date().toISOString());
 
+  // Did the large value written last launch survive? (proves data reaches disk)
+  var big = localStorage.getItem(BIG_KEY);
+  var bigPersisted = big !== null && big.length === BIG_SIZE;
+  if (marker) log('8 MB value survived relaunch: ' + (bigPersisted ? 'yes' : 'NO'));
+
   cleanup();  // leftovers from an interrupted run
   var single = testSingle();
   log('Largest single value: ' + fmt(single.max) + (single.capped ? '+ (test cap)' : ''));
@@ -136,8 +143,10 @@ function run() {
     totalCapped: total.capped,
     evicted: total.evicted,
     writeSpeed: Math.round(total.writeSpeed),
-    persisted: !!marker
+    persisted: !!marker,
+    bigPersisted: bigPersisted
   };
+  tryStore(BIG_KEY, makeString(BIG_SIZE));  // checked on next launch
   localStorage.setItem(RESULT_KEY, JSON.stringify(summary));
   log('Done: ' + JSON.stringify(summary));
   return summary;
