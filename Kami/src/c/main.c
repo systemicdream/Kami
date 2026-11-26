@@ -1,6 +1,6 @@
 /**
  * Kami - Pebble eBook Reader
- * Milestone 2: Reading engine
+ * Milestone 3: Book import
  *
  * The phone sends a book as numbered chunks (~1.5 KB, split on word
  * boundaries). The watch keeps a small window of chunks in memory
@@ -18,11 +18,14 @@
 #define CMD_CHUNK 1
 #define CMD_GET_LIBRARY 2
 #define CMD_LIBRARY 3
+#define CMD_OPEN_BOOK 4   // phone switched books: {book id, chunk total or -1}
+#define CMD_STATUS 5      // phone is busy (e.g. downloading): text to show
 
 #define INBOX_SIZE 2048
 #define OUTBOX_SIZE 128
 #define REQUEST_TIMEOUT_MS 3000
 #define MAX_RETRIES 3
+#define STATUS_TIMEOUT_MS 60000  // phone said it's busy: wait longer
 
 // ---- Persistence ----------------------------------------------------------
 
@@ -50,7 +53,7 @@ typedef struct {
   uint16_t off;
 } Pos;
 
-typedef enum { STATE_LOADING, STATE_READY, STATE_ERROR } ReaderState;
+typedef enum { STATE_LOADING, STATE_STATUS, STATE_READY, STATE_ERROR } ReaderState;
 
 static Window *s_window;
 static Layer *s_page_layer;
@@ -71,6 +74,7 @@ static bool s_back_pending = false;  // waiting for the previous chunk to page b
 static ReaderState s_state = STATE_LOADING;
 static char s_work[PAGE_MAX + 1];    // scratch text for measuring
 static char s_display[PAGE_MAX + 1]; // text of the page on screen
+static char s_status[128];           // message from the phone while waiting
 
 static int s_inflight = -1;
 static int s_retries = 0;
@@ -389,9 +393,80 @@ static void pump_requests(void) {
   }
 }
 
+static void save_position(void) {
+  persist_write_int(PERSIST_BOOK_ID, s_book_id);
+  persist_write_int(PERSIST_CHUNK, s_start.chunk);
+  persist_write_int(PERSIST_OFFSET, s_start.off);
+}
+
+static void cancel_request(void) {
+  if (s_timeout_timer) {
+    app_timer_cancel(s_timeout_timer);
+    s_timeout_timer = NULL;
+  }
+  s_inflight = -1;
+  s_retries = 0;
+}
+
+static void handle_open_book(DictionaryIterator *iter) {
+  Tuple *book = dict_find(iter, MESSAGE_KEY_KEY_BOOK_ID);
+  Tuple *total = dict_find(iter, MESSAGE_KEY_KEY_CHUNK_TOTAL);
+  if (!book) return;
+  int id = book->value->int32;
+  if (id == s_book_id && s_state != STATE_ERROR) {
+    // Phone JS just started: re-send a request it may have missed
+    if (s_inflight >= 0) {
+      cancel_request();
+      pump_requests();
+    }
+    return;
+  }
+
+  APP_LOG(APP_LOG_LEVEL_INFO, "Switching to book %d", id);
+  s_book_id = id;
+  s_start = (Pos){0, 0};
+  s_history_len = 0;
+  s_back_pending = false;
+  s_chunk_total = total ? (int)total->value->int32 : -1;
+  if (s_chunk_total == 0) s_chunk_total = -1;
+  reset_cache();
+  cancel_request();
+  s_status[0] = '\0';
+  s_state = STATE_LOADING;
+  save_position();
+  layer_mark_dirty(s_page_layer);
+  pump_requests();
+}
+
+static void handle_status(DictionaryIterator *iter) {
+  Tuple *text = dict_find(iter, MESSAGE_KEY_KEY_CHUNK_DATA);
+  if (!text) return;
+  strncpy(s_status, text->value->cstring, sizeof(s_status) - 1);
+  s_status[sizeof(s_status) - 1] = '\0';
+  // The phone is working on our request: give it more time
+  if (s_inflight >= 0) {
+    if (s_timeout_timer) app_timer_cancel(s_timeout_timer);
+    s_timeout_timer = app_timer_register(STATUS_TIMEOUT_MS, timeout_callback, NULL);
+    s_retries = 0;
+  }
+  if (s_state != STATE_READY) {
+    s_state = STATE_STATUS;
+    layer_mark_dirty(s_page_layer);
+  }
+}
+
 static void inbox_received_callback(DictionaryIterator *iter, void *context) {
   Tuple *cmd = dict_find(iter, MESSAGE_KEY_KEY_CMD);
-  if (!cmd || cmd->value->uint8 != CMD_CHUNK) return;
+  if (!cmd) return;
+  if (cmd->value->uint8 == CMD_OPEN_BOOK) {
+    handle_open_book(iter);
+    return;
+  }
+  if (cmd->value->uint8 == CMD_STATUS) {
+    handle_status(iter);
+    return;
+  }
+  if (cmd->value->uint8 != CMD_CHUNK) return;
 
   Tuple *book = dict_find(iter, MESSAGE_KEY_KEY_BOOK_ID);
   Tuple *index = dict_find(iter, MESSAGE_KEY_KEY_CHUNK_INDEX);
@@ -406,12 +481,7 @@ static void inbox_received_callback(DictionaryIterator *iter, void *context) {
   int idx = index->value->int32;
   if (idx != s_inflight) return;  // stale response
 
-  if (s_timeout_timer) {
-    app_timer_cancel(s_timeout_timer);
-    s_timeout_timer = NULL;
-  }
-  s_inflight = -1;
-  s_retries = 0;
+  cancel_request();
   s_chunk_total = total->value->int32;
 
   // Saved position no longer valid (book changed): start over
@@ -448,7 +518,12 @@ static void outbox_failed_callback(DictionaryIterator *iter, AppMessageResult re
 
 static void render(void) {
   if (s_state == STATE_ERROR) return;
-  s_state = layout_page() ? STATE_READY : STATE_LOADING;
+  if (layout_page()) {
+    s_state = STATE_READY;
+    s_status[0] = '\0';
+  } else {
+    s_state = s_status[0] ? STATE_STATUS : STATE_LOADING;
+  }
   layer_mark_dirty(s_page_layer);
 }
 
@@ -470,6 +545,10 @@ static void page_update_proc(Layer *layer, GContext *ctx) {
   }
   if (s_state == STATE_LOADING) {
     draw_message(ctx, bounds, "Loading...");
+    return;
+  }
+  if (s_state == STATE_STATUS) {
+    draw_message(ctx, bounds, s_status);
     return;
   }
 
@@ -572,9 +651,7 @@ static void init(void) {
 }
 
 static void deinit(void) {
-  persist_write_int(PERSIST_BOOK_ID, s_book_id);
-  persist_write_int(PERSIST_CHUNK, s_start.chunk);
-  persist_write_int(PERSIST_OFFSET, s_start.off);
+  save_position();
   if (s_timeout_timer) app_timer_cancel(s_timeout_timer);
   if (s_pump_timer) app_timer_cancel(s_pump_timer);
   window_destroy(s_window);
