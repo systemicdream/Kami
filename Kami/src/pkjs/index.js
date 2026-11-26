@@ -1,6 +1,6 @@
 /**
  * Kami - PebbleKit JS
- * Milestone 3: Book import
+ * Milestone 4: Library menu
  *
  * Downloads plain-text books (Project Gutenberg links work best), keeps a
  * library in localStorage, and serves the current book to the watch in
@@ -21,6 +21,13 @@ var CMD_GET_LIBRARY = 2;
 var CMD_LIBRARY = 3;
 var CMD_OPEN_BOOK = 4;
 var CMD_STATUS = 5;
+var CMD_SELECT_BOOK = 6;  // watch -> phone: book picked in the library menu
+var CMD_SAVE_POS = 7;     // watch -> phone: reading position in a book
+
+// The watch's AppMessage inbox is 2048 bytes; keep the library list under this
+var LIBRARY_BYTES = 1700;
+var LIBRARY_TITLE_CHARS = 40;
+var LIBRARY_MAX_BOOKS = 32;  // MAX_BOOKS in library_menu.c
 
 // Max UTF-8 bytes per chunk. The watch buffers CHUNK_MAX (1600) bytes and
 // its AppMessage inbox is 2048 bytes, so leave headroom for the dictionary.
@@ -63,8 +70,51 @@ function sendStatus(message) {
   send({ 'KEY_CMD': CMD_STATUS, 'KEY_CHUNK_DATA': message });
 }
 
+// Switch the watch to a book, including where it was left (if known).
 function sendOpenBook(id, total) {
-  send({ 'KEY_CMD': CMD_OPEN_BOOK, 'KEY_BOOK_ID': id, 'KEY_CHUNK_TOTAL': total });
+  var pos = library.getPosition(library.load(), id);
+  var dict = { 'KEY_CMD': CMD_OPEN_BOOK, 'KEY_BOOK_ID': id, 'KEY_CHUNK_TOTAL': total };
+  if (pos) {
+    dict.KEY_CHUNK_INDEX = pos.chunk;
+    dict.KEY_OFFSET = pos.offset;
+  }
+  send(dict);
+}
+
+// Library list for the watch menu: one "id\tpercent\ttitle" line per book,
+// most recently opened first. The sample book is listed only when the
+// library is empty.
+function sendLibrary() {
+  var lib = library.load();
+  var books = lib.books.slice().sort(function(a, b) { return b.opened - a.opened; });
+  var lines = [];
+  var bytes = 0;
+  if (!books.length) {
+    lines.push(library.SAMPLE_ID + '\t' + library.percentRead(lib, library.SAMPLE_ID) + '\tSample book');
+  }
+  for (var i = 0; i < books.length; i++) {
+    var b = books[i];
+    var title = (b.title || 'Not downloaded yet').replace(/[\t\n]/g, ' ');
+    if (title.length > LIBRARY_TITLE_CHARS) title = title.substring(0, LIBRARY_TITLE_CHARS - 3) + '...';
+    var line = b.id + '\t' + library.percentRead(lib, b.id) + '\t' + title;
+    var lineBytes = unescape(encodeURIComponent(line)).length + 1;
+    if (bytes + lineBytes > LIBRARY_BYTES || lines.length >= LIBRARY_MAX_BOOKS) break;
+    lines.push(line);
+    bytes += lineBytes;
+  }
+  send({ 'KEY_CMD': CMD_LIBRARY, 'KEY_BOOK_ID': lib.current, 'KEY_LIBRARY_DATA': lines.join('\n') });
+}
+
+function handleSelectBook(id) {
+  var lib = library.load();
+  if (!library.setCurrent(lib, id)) {
+    console.log('Watch picked unknown book ' + id);
+    sendOpenBook(lib.current, -1);
+    return;
+  }
+  console.log('Watch opened book ' + id);
+  var book = loadChunks(lib, id);
+  sendOpenBook(id, book ? book.chunks.length : -1);
 }
 
 // ---- Loaded book ------------------------------------------------------------
@@ -165,8 +215,11 @@ function fetchFirst(urls, i, lastError, done, fail) {
   var xhr = new XMLHttpRequest();
   xhr.open('GET', urls[i], true);
   xhr.timeout = DOWNLOAD_TIMEOUT_MS;
+  // Gutenberg's mirror sends text/plain without a charset, which some
+  // clients read as Latin-1. Books are UTF-8.
+  if (xhr.overrideMimeType) xhr.overrideMimeType('text/plain; charset=utf-8');
   xhr.onload = function() {
-    if (xhr.status >= 200 && xhr.status < 300 && xhr.responseText) done(xhr.responseText);
+    if (xhr.status >= 200 && xhr.status < 300 && xhr.responseText) done(text.repairUtf8(xhr.responseText));
     else next('HTTP ' + xhr.status);
   };
   xhr.onerror = function() { next('network error'); };
@@ -318,7 +371,15 @@ Pebble.addEventListener('appmessage', function(e) {
   if (cmd === CMD_GET_CHUNK) {
     handleChunkRequest(dict.KEY_BOOK_ID || 0, dict.KEY_CHUNK_INDEX || 0);
   } else if (cmd === CMD_GET_LIBRARY) {
-    // TODO (milestone 4): send library list
+    sendLibrary();
+  } else if (cmd === CMD_SELECT_BOOK) {
+    handleSelectBook(dict.KEY_BOOK_ID || 0);
+  } else if (cmd === CMD_SAVE_POS) {
+    console.log('Position: book ' + dict.KEY_BOOK_ID + ' chunk ' + dict.KEY_CHUNK_INDEX + '/' +
+                dict.KEY_CHUNK_TOTAL + ' offset ' + dict.KEY_OFFSET);
+    var lib = library.load();
+    library.setPosition(lib, dict.KEY_BOOK_ID || 0, dict.KEY_CHUNK_INDEX || 0,
+                        dict.KEY_OFFSET || 0, dict.KEY_CHUNK_TOTAL || 0);
   }
 });
 

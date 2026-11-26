@@ -127,7 +127,36 @@ function parseGutenberg(raw) {
   };
 }
 
+// If UTF-8 text was decoded as Latin-1/Windows-1252 ("Aliceâ€™s"), undo it.
+// Only applies when the telltale sequences appear and the whole text
+// re-decodes cleanly, so correct text is never touched.
+var WIN1252 = { 0x20AC: 0x80, 0x201A: 0x82, 0x0192: 0x83, 0x201E: 0x84, 0x2026: 0x85, 0x2020: 0x86,
+  0x2021: 0x87, 0x02C6: 0x88, 0x2030: 0x89, 0x0160: 0x8A, 0x2039: 0x8B, 0x0152: 0x8C, 0x017D: 0x8E,
+  0x2018: 0x91, 0x2019: 0x92, 0x201C: 0x93, 0x201D: 0x94, 0x2022: 0x95, 0x2013: 0x96, 0x2014: 0x97,
+  0x02DC: 0x98, 0x2122: 0x99, 0x0161: 0x9A, 0x203A: 0x9B, 0x0153: 0x9C, 0x017E: 0x9E, 0x0178: 0x9F };
+
+function repairUtf8(str) {
+  if (!/[\u00C2-\u00F4][\u0080-\u00BF\u0152-\u2122]/.test(str)) return str;
+  var bytes = [];
+  for (var i = 0; i < str.length; i++) {
+    var c = str.charCodeAt(i);
+    if (c < 0x100) bytes.push(c);
+    else if (WIN1252[c] !== undefined) bytes.push(WIN1252[c]);
+    else return str;  // a real non-Latin-1 character: the text wasn't mis-decoded
+  }
+  var escaped = '';
+  for (var j = 0; j < bytes.length; j++) {
+    escaped += bytes[j] < 0x80 ? String.fromCharCode(bytes[j]) : '%' + bytes[j].toString(16).toUpperCase();
+  }
+  try {
+    return decodeURIComponent(escaped.replace(/%(?![0-9A-F]{2})/g, '%25'));
+  } catch (e) {
+    return str;  // not valid UTF-8 after all
+  }
+}
+
 module.exports = {
+  repairUtf8: repairUtf8,
   normalizeText: normalizeText,
   chunkText: chunkText,
   resolveBookUrl: resolveBookUrl,

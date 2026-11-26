@@ -28,7 +28,8 @@
       "KEY_CHUNK_INDEX": 2,
       "KEY_CHUNK_DATA": 3,
       "KEY_CHUNK_TOTAL": 4,
-      "KEY_LIBRARY_DATA": 5
+      "KEY_LIBRARY_DATA": 5,
+      "KEY_OFFSET": 6
     },
     "resources": {
       "media": []
