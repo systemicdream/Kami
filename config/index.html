@@ -64,6 +64,7 @@
   }
   button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-text); font-weight: 600; }
   button.danger { color: var(--danger); }
+  button.danger.armed { background: var(--danger); border-color: var(--danger); color: var(--card); font-weight: 600; }
   button.link { border: none; background: none; color: var(--muted); padding: 8px 0; }
   form { padding: 16px; display: grid; gap: 12px; }
   label { display: grid; gap: 6px; font-size: 14px; color: var(--muted); }
@@ -150,6 +151,31 @@
     return m ? m[1].replace(/^www\./, '') : '';
   }
 
+  // The Pebble app's web view doesn't show confirm() dialogs (it returns
+  // false), so confirm in place: first tap arms the button, second removes.
+  function removeButton(b) {
+    var armed = false;
+    var timer = null;
+    var btn = el('button', {
+      type: 'button', class: 'danger', text: 'Remove', 'aria-label': 'Remove ' + (b.title || 'book'),
+      onclick: function () {
+        if (armed) {
+          finish({ remove: b.id });
+          return;
+        }
+        armed = true;
+        btn.textContent = 'Tap to confirm';
+        btn.classList.add('armed');
+        timer = setTimeout(function () {
+          armed = false;
+          btn.textContent = 'Remove';
+          btn.classList.remove('armed');
+        }, 4000);
+      }
+    });
+    return btn;
+  }
+
   function renderLibrary() {
     var box = document.getElementById('library');
     box.textContent = '';
@@ -168,12 +194,7 @@
         isCurrent
           ? el('span', { class: 'badge', text: 'Reading' })
           : el('button', { type: 'button', text: 'Read', onclick: function () { finish({ open: b.id }); } }),
-        el('button', {
-          type: 'button', class: 'danger', text: 'Remove', 'aria-label': 'Remove ' + (b.title || 'book'),
-          onclick: function () {
-            if (confirm('Remove "' + (b.title || 'this book') + '" from Kami?')) finish({ remove: b.id });
-          }
-        })
+        removeButton(b)
       ]));
     });
   }
