@@ -45,7 +45,15 @@ function find(lib, id) {
   return null;
 }
 
+// Adding a link that's already in the library opens that book instead.
+// Returns {book, existing}.
 function add(lib, url, title) {
+  for (var i = 0; i < lib.books.length; i++) {
+    if (lib.books[i].url === url) {
+      setCurrent(lib, lib.books[i].id);
+      return { book: lib.books[i], existing: true };
+    }
+  }
   var book = {
     id: lib.nextId++,
     url: url,
@@ -57,7 +65,7 @@ function add(lib, url, title) {
   lib.books.push(book);
   lib.current = book.id;
   save(lib);
-  return book;
+  return { book: book, existing: false };
 }
 
 function setCurrent(lib, id) {

@@ -231,7 +231,14 @@ function handleConfigResult(action) {
   if (action.add) {
     var url = text.resolveBookUrl(action.add.url);
     if (!url) return;
-    var book = library.add(lib, url, action.add.title);
+    var added = library.add(lib, url, action.add.title);
+    var book = added.book;
+    if (added.existing) {
+      console.log('Book ' + book.id + ' already in library, opening it');
+      var have = loadChunks(lib, book.id);
+      sendOpenBook(book.id, have ? have.chunks.length : -1);
+      return;
+    }
     console.log('Added book ' + book.id + ': ' + url);
     sendOpenBook(book.id, -1);  // watch will ask for chunk 0, which downloads it
     pending = { book: book.id, chunk: 0 };
