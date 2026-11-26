@@ -1,0 +1,38 @@
+# Publishes the Kami settings page (config/) to GitHub Pages at
+# https://<owner>.github.io/Kami/config/ — the URL the watch app opens.
+# Only config/ is published, not the rest of the repo.
+name: Publish settings page
+
+on:
+  push:
+    branches: [main]
+    paths: ['config/**', '.github/workflows/pages.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}config/
+    steps:
+      - uses: actions/checkout@v4
+      - name: Stage site
+        run: |
+          mkdir -p _site/config
+          cp -R config/. _site/config/
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+      - id: deployment
+        uses: actions/deploy-pages@v4
