@@ -95,7 +95,8 @@ function loadChunks(lib, id) {
     }
   }
   loaded = { id: id, chunks: text.chunkText(prepared, CHUNK_BYTES) };
-  console.log('Loaded book ' + id + ': ' + loaded.chunks.length + ' chunks');
+  console.log('Loaded book ' + id + ': ' + prepared.length + ' chars, ' + loaded.chunks.length +
+              ' chunks, starts "' + prepared.substring(0, 60).replace(/\n/g, ' ') + '"');
   return loaded;
 }
 
@@ -222,10 +223,51 @@ function configUrl() {
       return { id: b.id, title: b.title, author: b.author, url: b.url };
     })
   };
-  return CONFIG_URL + '#' + encodeURIComponent(JSON.stringify(state));
+  // ?v= defeats caching: GitHub Pages sends max-age=600, so the Pebble app's
+  // web view would otherwise keep showing an old version of the page.
+  return CONFIG_URL + '?v=' + Date.now() + '#' + encodeURIComponent(JSON.stringify(state));
+}
+
+// Apply a batch of changes from the settings page's Save button:
+// {add: [{tempId, url, title}], remove: [id], current: id or tempId}
+function applyChanges(changes) {
+  var lib = library.load();
+  var idFor = {};  // tempId -> real id
+
+  (changes.remove || []).forEach(function(id) {
+    library.remove(lib, id);
+    if (loaded && loaded.id === id) loaded = null;
+  });
+  (changes.add || []).forEach(function(a) {
+    var url = text.resolveBookUrl(a.url);
+    if (!url) return;
+    var result = library.add(lib, url, a.title);
+    idFor[a.tempId] = result.book.id;
+    console.log((result.existing ? 'Already had book ' : 'Added book ') + result.book.id + ': ' + url);
+  });
+
+  var target = changes.current;
+  if (target !== undefined && target !== null && idFor[target] !== undefined) target = idFor[target];
+  if (target === undefined || target === null || !library.setCurrent(lib, target)) {
+    // Keep whatever library.add/remove left as current
+    target = lib.current;
+  }
+
+  var cur = loadChunks(lib, target);
+  sendOpenBook(target, cur ? cur.chunks.length : -1);
+  if (!cur) {
+    // Start downloading now; the watch's chunk request will be answered when done
+    pending = { book: target, chunk: 0 };
+    download(lib, library.find(lib, target));
+  }
 }
 
 function handleConfigResult(action) {
+  console.log('Settings action: ' + JSON.stringify(action));
+  if (action.changes) {
+    applyChanges(action.changes);
+    return;
+  }
   var lib = library.load();
 
   if (action.add) {
@@ -281,10 +323,15 @@ Pebble.addEventListener('appmessage', function(e) {
 });
 
 Pebble.addEventListener('showConfiguration', function() {
+  var lib = library.load();
+  console.log('Opening settings. Library: current=' + lib.current + ' ' + lib.books.map(function(b) {
+    return b.id + ':' + (b.title || '?') + (b.cached ? '(cached)' : '');
+  }).join(', '));
   Pebble.openURL(configUrl());
 });
 
 Pebble.addEventListener('webviewclosed', function(e) {
+  console.log('Settings closed, response: ' + (e && e.response ? e.response : '(none)'));
   if (!e || !e.response) return;  // closed without choosing anything
   var action;
   try {

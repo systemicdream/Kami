@@ -76,6 +76,15 @@
   .hint { font-size: 14px; color: var(--muted); margin: 0; }
   .suggestions { display: flex; flex-wrap: wrap; gap: 8px; padding: 0 16px 16px; }
   .suggestions button { font-size: 14px; padding: 6px 10px; }
+  .savebar {
+    position: fixed; left: 0; right: 0; bottom: 0;
+    display: flex; justify-content: space-between; align-items: center; gap: 12px;
+    padding: 12px 16px max(12px, env(safe-area-inset-bottom));
+    background: var(--card); border-top: 1px solid var(--line);
+  }
+  .savebar[hidden] { display: none; }
+  .savebar .primary { flex: 1; max-width: 320px; padding: 12px; }
+  body { padding-bottom: 96px; }
   .error { color: var(--danger); font-size: 14px; margin: 0; min-height: 1em; }
 </style>
 </head>
@@ -103,11 +112,16 @@
       </label>
       <p class="hint">A Project Gutenberg book page, or a link to any plain-text (.txt) file.</p>
       <p class="error" id="error" role="alert"></p>
-      <button class="primary" type="submit">Add and start reading</button>
+      <button class="primary" type="submit">Add book</button>
     </form>
     <div class="suggestions" id="suggestions"></div>
   </div>
 </main>
+
+<div class="savebar" id="savebar" hidden>
+  <button class="link" id="discard" type="button">Discard</button>
+  <button class="primary" id="save" type="button">Save changes</button>
+</div>
 
 <script>
 (function () {
@@ -120,19 +134,41 @@
   ];
 
   // Library state is passed by the watch app in the URL hash
-  var state = { current: 0, books: [] };
+  var original = { current: 0, books: [] };
   try {
     var hash = location.hash.slice(1);
-    if (hash) state = JSON.parse(decodeURIComponent(hash));
+    if (hash) original = JSON.parse(decodeURIComponent(hash));
   } catch (e) { /* show an empty library */ }
+
+  // A settings page can only send data back by closing, so changes are made
+  // here first and sent together on Save:
+  //   {changes: {add: [{tempId, url, title}], remove: [id], current: id|tempId}}
+  // Books added on this page get negative temporary ids.
+  var books = (original.books || []).slice();
+  var current = original.current;
+  var added = [];
+  var removed = [];
+  var nextTempId = -1;
+
+  function isDirty() {
+    return added.length > 0 || removed.length > 0 || current !== original.current;
+  }
 
   function returnTo() {
     var m = location.search.match(/[?&]return_to=([^&]*)/);
     return m ? decodeURIComponent(m[1]) : 'pebblejs://close#';
   }
 
-  function finish(action) {
-    location.href = returnTo() + (action ? encodeURIComponent(JSON.stringify(action)) : '');
+  function finish(payload) {
+    location.href = returnTo() + (payload ? encodeURIComponent(JSON.stringify(payload)) : '');
+  }
+
+  function save() {
+    if (!isDirty()) {
+      finish(null);
+      return;
+    }
+    finish({ changes: { add: added, remove: removed, current: current } });
   }
 
   function el(tag, attrs, children) {
@@ -147,26 +183,67 @@
   }
 
   function hostOf(url) {
-    var m = String(url || '').match(/^https?:\/\/([^/]+)/i);
+    var m = String(url || '').match(/^(?:https?:\/\/)?([^/]+)/i);
     return m ? m[1].replace(/^www\./, '') : '';
+  }
+
+  // Same book? Compare Gutenberg ebook numbers, otherwise the link itself.
+  function bookKey(url) {
+    var u = String(url || '').trim().toLowerCase();
+    var m = u.match(/gutenberg\.org\/(?:ebooks|files|cache\/epub)\/(\d+)/);
+    return m ? 'pg' + m[1] : u.replace(/^https?:\/\//, '').replace(/^www\./, '');
+  }
+
+  function addBook(url, title) {
+    var key = bookKey(url);
+    for (var i = 0; i < books.length; i++) {
+      if (bookKey(books[i].url) === key) {
+        current = books[i].id;  // already in the library: just read it
+        render();
+        return;
+      }
+    }
+    var book = { id: nextTempId--, url: url, title: title, pending: true };
+    books.push(book);
+    added.push({ tempId: book.id, url: url, title: title });
+    current = book.id;
+    render();
+  }
+
+  function removeBook(b) {
+    books = books.filter(function (x) { return x.id !== b.id; });
+    if (b.id < 0) {
+      added = added.filter(function (a) { return a.tempId !== b.id; });
+    } else {
+      removed.push(b.id);
+    }
+    if (current === b.id) current = books.length ? books[books.length - 1].id : 0;
+    render();
+  }
+
+  function discard() {
+    books = (original.books || []).slice();
+    current = original.current;
+    added = [];
+    removed = [];
+    render();
   }
 
   // The Pebble app's web view doesn't show confirm() dialogs (it returns
   // false), so confirm in place: first tap arms the button, second removes.
   function removeButton(b) {
     var armed = false;
-    var timer = null;
     var btn = el('button', {
       type: 'button', class: 'danger', text: 'Remove', 'aria-label': 'Remove ' + (b.title || 'book'),
       onclick: function () {
         if (armed) {
-          finish({ remove: b.id });
+          removeBook(b);
           return;
         }
         armed = true;
         btn.textContent = 'Tap to confirm';
         btn.classList.add('armed');
-        timer = setTimeout(function () {
+        setTimeout(function () {
           armed = false;
           btn.textContent = 'Remove';
           btn.classList.remove('armed');
@@ -179,24 +256,33 @@
   function renderLibrary() {
     var box = document.getElementById('library');
     box.textContent = '';
-    var books = (state.books || []).slice().reverse();
-    if (!books.length) {
+    var list = books.slice().reverse();
+    if (!list.length) {
       box.appendChild(el('div', { class: 'empty', text: 'No books yet. The watch is showing the sample book.' }));
       return;
     }
-    books.forEach(function (b) {
-      var isCurrent = b.id === state.current;
+    list.forEach(function (b) {
+      var isCurrent = b.id === current;
+      var meta = b.pending ? 'Downloads when you save' : (b.author || hostOf(b.url));
       box.appendChild(el('div', { class: 'book' }, [
         el('div', { class: 'book-info' }, [
-          el('div', { class: 'book-title', text: b.title || 'Not downloaded yet' }),
-          el('div', { class: 'book-meta', text: b.author || hostOf(b.url) })
+          el('div', { class: 'book-title', text: b.title || (b.pending ? hostOf(b.url) : 'Not downloaded yet') }),
+          el('div', { class: 'book-meta', text: meta })
         ]),
         isCurrent
           ? el('span', { class: 'badge', text: 'Reading' })
-          : el('button', { type: 'button', text: 'Read', onclick: function () { finish({ open: b.id }); } }),
+          : el('button', { type: 'button', text: 'Read', onclick: function () { current = b.id; render(); } }),
         removeButton(b)
       ]));
     });
+  }
+
+  function render() {
+    renderLibrary();
+    var dirty = isDirty();
+    document.getElementById('done').textContent = dirty ? 'Save' : 'Done';
+    document.getElementById('done').classList.toggle('primary', dirty);
+    document.getElementById('savebar').hidden = !dirty;
   }
 
   function renderSuggestions() {
@@ -204,17 +290,16 @@
     SUGGESTIONS.forEach(function (s) {
       box.appendChild(el('button', {
         type: 'button', text: s.title,
-        onclick: function () {
-          finish({ add: { url: 'https://www.gutenberg.org/ebooks/' + s.id, title: s.title } });
-        }
+        onclick: function () { addBook('https://www.gutenberg.org/ebooks/' + s.id, s.title); }
       }));
     });
   }
 
   document.getElementById('add-form').addEventListener('submit', function (e) {
     e.preventDefault();
-    var url = document.getElementById('url').value.trim();
-    var title = document.getElementById('title').value.trim();
+    var urlField = document.getElementById('url');
+    var titleField = document.getElementById('title');
+    var url = urlField.value.trim();
     var error = document.getElementById('error');
     if (!url) {
       error.textContent = 'Paste a link to a book first.';
@@ -224,13 +309,20 @@
       error.textContent = "That doesn't look like a link.";
       return;
     }
-    finish({ add: { url: url, title: title } });
+    error.textContent = '';
+    addBook(url, titleField.value.trim());
+    urlField.value = '';
+    titleField.value = '';
+    urlField.blur();
+    titleField.blur();
   });
 
-  document.getElementById('done').addEventListener('click', function () { finish(null); });
+  document.getElementById('done').addEventListener('click', save);
+  document.getElementById('save').addEventListener('click', save);
+  document.getElementById('discard').addEventListener('click', discard);
 
-  renderLibrary();
   renderSuggestions();
+  render();
 })();
 </script>
 </body>
