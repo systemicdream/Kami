@@ -449,8 +449,6 @@ static AppTimer *s_control_timer = NULL;
 static void flush_control(void) {
   if (s_select_pending && send_select()) s_select_pending = false;
   else if (!s_select_pending && s_pos_pending && send_position()) {
-    APP_LOG(APP_LOG_LEVEL_DEBUG, "Sent position: book %d chunk %d off %d", s_book_id,
-            s_start.chunk, s_start.off);
     s_pos_pending = false;
     s_pos_sent_chunk = s_start.chunk;
   }
@@ -495,6 +493,10 @@ static void handle_open_book(DictionaryIterator *iter) {
   if (!book) return;
   int id = book->value->int32;
   if (s_awaiting_open && id != s_book_id) return;  // reply to an older request
+  // Opened from Settings: show the reader even if the menu is in front
+  if (dict_find(iter, MESSAGE_KEY_KEY_SHOW) && window_stack_get_top_window() != s_window) {
+    window_stack_push(s_window, true);
+  }
   if (id == s_book_id && s_state != STATE_ERROR && !s_awaiting_open) {
     // Phone JS just started: re-send a request it may have missed
     if (s_inflight >= 0) {
