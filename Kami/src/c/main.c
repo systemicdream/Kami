@@ -1,6 +1,6 @@
 /**
  * Kami - Pebble eBook Reader
- * Milestone 3: Book import
+ * Milestone 4: Library menu
  *
  * The phone sends a book as numbered chunks (~1.5 KB, split on word
  * boundaries). The watch keeps a small window of chunks in memory
@@ -11,6 +11,7 @@
  */
 
 #include <pebble.h>
+#include "library_menu.h"
 
 // ---- Protocol -------------------------------------------------------------
 
@@ -20,6 +21,8 @@
 #define CMD_LIBRARY 3
 #define CMD_OPEN_BOOK 4   // phone switched books: {book id, chunk total or -1}
 #define CMD_STATUS 5      // phone is busy (e.g. downloading): text to show
+#define CMD_SELECT_BOOK 6 // watch picked a book in the menu: {book id}
+#define CMD_SAVE_POS 7    // watch reports its place: {book, chunk, offset, total}
 
 #define INBOX_SIZE 2048
 #define OUTBOX_SIZE 128
@@ -76,6 +79,13 @@ static char s_work[PAGE_MAX + 1];    // scratch text for measuring
 static char s_display[PAGE_MAX + 1]; // text of the page on screen
 static char s_status[128];           // message from the phone while waiting
 
+static bool s_awaiting_open = false;  // picked in the menu; waiting for the phone's OPEN_BOOK
+static bool s_select_pending = false; // SELECT not yet handed to the outbox
+static bool s_pos_pending = false;    // SAVE_POS not yet handed to the outbox
+static int s_pos_sent_chunk = -1;     // chunk last reported to the phone
+static int s_open_retries = 0;
+static AppTimer *s_open_timer = NULL;
+
 static int s_inflight = -1;
 static int s_retries = 0;
 static AppTimer *s_timeout_timer = NULL;
@@ -83,6 +93,7 @@ static AppTimer *s_pump_timer = NULL;
 
 static void pump_requests(void);
 static void render(void);
+static void report_position(bool force);
 
 // ---- Chunk cache ----------------------------------------------------------
 
@@ -323,6 +334,7 @@ static void next_page(void) {
   s_start = s_end;
   render();
   pump_requests();
+  report_position(false);
 }
 
 static void prev_page(void) {
@@ -331,6 +343,7 @@ static void prev_page(void) {
     s_start = s_history[--s_history_len];
     render();
     pump_requests();
+    report_position(false);
     return;
   }
   Pos p;
@@ -370,7 +383,7 @@ static void timeout_callback(void *data) {
   s_inflight = -1;
   if (++s_retries > MAX_RETRIES) {
     s_state = STATE_ERROR;
-    layer_mark_dirty(s_page_layer);
+    if (s_page_layer) layer_mark_dirty(s_page_layer);
     return;
   }
   pump_requests();
@@ -382,7 +395,7 @@ static void pump_timer_callback(void *data) {
 }
 
 static void pump_requests(void) {
-  if (s_inflight >= 0 || s_state == STATE_ERROR) return;
+  if (s_inflight >= 0 || s_state == STATE_ERROR || s_awaiting_open) return;
   int want = next_missing_chunk();
   if (want < 0) return;
   if (send_request(want)) {
@@ -408,12 +421,83 @@ static void cancel_request(void) {
   s_retries = 0;
 }
 
+// ---- Control messages (select book, save position) -------------------------
+// These go out when the outbox is free; chunk requests have their own retry.
+
+static bool send_select(void) {
+  DictionaryIterator *iter;
+  if (app_message_outbox_begin(&iter) != APP_MSG_OK) return false;
+  dict_write_uint8(iter, MESSAGE_KEY_KEY_CMD, CMD_SELECT_BOOK);
+  dict_write_int32(iter, MESSAGE_KEY_KEY_BOOK_ID, s_book_id);
+  return app_message_outbox_send() == APP_MSG_OK;
+}
+
+static bool send_position(void) {
+  DictionaryIterator *iter;
+  if (app_message_outbox_begin(&iter) != APP_MSG_OK) return false;
+  dict_write_uint8(iter, MESSAGE_KEY_KEY_CMD, CMD_SAVE_POS);
+  dict_write_int32(iter, MESSAGE_KEY_KEY_BOOK_ID, s_book_id);
+  dict_write_int32(iter, MESSAGE_KEY_KEY_CHUNK_INDEX, s_start.chunk);
+  dict_write_int32(iter, MESSAGE_KEY_KEY_OFFSET, s_start.off);
+  dict_write_int32(iter, MESSAGE_KEY_KEY_CHUNK_TOTAL, s_chunk_total);
+  return app_message_outbox_send() == APP_MSG_OK;
+}
+
+static void control_timer_callback(void *data);
+static AppTimer *s_control_timer = NULL;
+
+static void flush_control(void) {
+  if (s_select_pending && send_select()) s_select_pending = false;
+  else if (!s_select_pending && s_pos_pending && send_position()) {
+    s_pos_pending = false;
+    s_pos_sent_chunk = s_start.chunk;
+  }
+  if ((s_select_pending || s_pos_pending) && !s_control_timer) {
+    s_control_timer = app_timer_register(200, control_timer_callback, NULL);
+  }
+}
+
+static void control_timer_callback(void *data) {
+  s_control_timer = NULL;
+  flush_control();
+}
+
+// Tell the phone where we are: always when forced (leaving the reader),
+// otherwise only when the chunk changed, to keep traffic low.
+static void report_position(bool force) {
+  if (s_awaiting_open || s_chunk_total <= 0) return;
+  if (!force && s_start.chunk == s_pos_sent_chunk) return;
+  s_pos_pending = true;
+  flush_control();
+}
+
+static void open_timeout_callback(void *data) {
+  s_open_timer = NULL;
+  if (!s_awaiting_open) return;
+  if (++s_open_retries > MAX_RETRIES) {
+    s_awaiting_open = false;
+    s_state = STATE_ERROR;
+    if (s_page_layer) layer_mark_dirty(s_page_layer);
+    return;
+  }
+  s_select_pending = true;
+  flush_control();
+  s_open_timer = app_timer_register(REQUEST_TIMEOUT_MS, open_timeout_callback, NULL);
+}
+
 static void handle_open_book(DictionaryIterator *iter) {
   Tuple *book = dict_find(iter, MESSAGE_KEY_KEY_BOOK_ID);
   Tuple *total = dict_find(iter, MESSAGE_KEY_KEY_CHUNK_TOTAL);
+  Tuple *chunk = dict_find(iter, MESSAGE_KEY_KEY_CHUNK_INDEX);
+  Tuple *offset = dict_find(iter, MESSAGE_KEY_KEY_OFFSET);
   if (!book) return;
   int id = book->value->int32;
-  if (id == s_book_id && s_state != STATE_ERROR) {
+  if (s_awaiting_open && id != s_book_id) return;  // reply to an older request
+  // Opened from Settings: show the reader even if the menu is in front
+  if (dict_find(iter, MESSAGE_KEY_KEY_SHOW) && window_stack_get_top_window() != s_window) {
+    window_stack_push(s_window, true);
+  }
+  if (id == s_book_id && s_state != STATE_ERROR && !s_awaiting_open) {
     // Phone JS just started: re-send a request it may have missed
     if (s_inflight >= 0) {
       cancel_request();
@@ -422,9 +506,20 @@ static void handle_open_book(DictionaryIterator *iter) {
     return;
   }
 
-  APP_LOG(APP_LOG_LEVEL_INFO, "Switching to book %d", id);
+  APP_LOG(APP_LOG_LEVEL_INFO, "Opening book %d", id);
+  if (s_open_timer) {
+    app_timer_cancel(s_open_timer);
+    s_open_timer = NULL;
+  }
+  s_awaiting_open = false;
   s_book_id = id;
+  // Resume where this book was left, if the phone remembers
   s_start = (Pos){0, 0};
+  if (chunk && offset && chunk->value->int32 >= 0) {
+    s_start.chunk = chunk->value->int32;
+    s_start.off = offset->value->int32;
+  }
+  s_pos_sent_chunk = s_start.chunk;
   s_history_len = 0;
   s_back_pending = false;
   s_chunk_total = total ? (int)total->value->int32 : -1;
@@ -434,7 +529,7 @@ static void handle_open_book(DictionaryIterator *iter) {
   s_status[0] = '\0';
   s_state = STATE_LOADING;
   save_position();
-  layer_mark_dirty(s_page_layer);
+  if (s_page_layer) layer_mark_dirty(s_page_layer);
   pump_requests();
 }
 
@@ -451,7 +546,7 @@ static void handle_status(DictionaryIterator *iter) {
   }
   if (s_state != STATE_READY) {
     s_state = STATE_STATUS;
-    layer_mark_dirty(s_page_layer);
+    if (s_page_layer) layer_mark_dirty(s_page_layer);
   }
 }
 
@@ -464,6 +559,10 @@ static void inbox_received_callback(DictionaryIterator *iter, void *context) {
   }
   if (cmd->value->uint8 == CMD_STATUS) {
     handle_status(iter);
+    return;
+  }
+  if (cmd->value->uint8 == CMD_LIBRARY) {
+    library_menu_handle_library(iter);
     return;
   }
   if (cmd->value->uint8 != CMD_CHUNK) return;
@@ -512,12 +611,17 @@ static void inbox_dropped_callback(AppMessageResult reason, void *context) {
 
 static void outbox_failed_callback(DictionaryIterator *iter, AppMessageResult reason, void *context) {
   APP_LOG(APP_LOG_LEVEL_ERROR, "Outbox failed: %d", reason);
+  flush_control();
+}
+
+static void outbox_sent_callback(DictionaryIterator *iter, void *context) {
+  flush_control();
 }
 
 // ---- Drawing --------------------------------------------------------------
 
 static void render(void) {
-  if (s_state == STATE_ERROR) return;
+  if (s_state == STATE_ERROR || !s_page_layer) return;  // reader hidden: laid out on load
   if (layout_page()) {
     s_state = STATE_READY;
     s_status[0] = '\0';
@@ -621,11 +725,61 @@ static void window_load(Window *window) {
   layer_set_update_proc(s_page_layer, page_update_proc);
   layer_add_child(root, s_page_layer);
 
+  render();
   pump_requests();
+}
+
+static void window_disappear(Window *window) {
+  save_position();
+  report_position(true);
 }
 
 static void window_unload(Window *window) {
   layer_destroy(s_page_layer);
+  s_page_layer = NULL;
+}
+
+// ---- Interface for the library menu ---------------------------------------
+
+bool comm_send_library_request(void) {
+  DictionaryIterator *iter;
+  if (app_message_outbox_begin(&iter) != APP_MSG_OK) return false;
+  dict_write_uint8(iter, MESSAGE_KEY_KEY_CMD, CMD_GET_LIBRARY);
+  return app_message_outbox_send() == APP_MSG_OK;
+}
+
+int reader_book_id(void) {
+  return s_book_id;
+}
+
+int reader_percent(void) {
+  if (s_chunk_total <= 0 || s_awaiting_open) return -1;
+  if (s_at_end) return 100;
+  return s_start.chunk * 100 / s_chunk_total;
+}
+
+void reader_open_book(int book_id) {
+  if (book_id != s_book_id || s_state == STATE_ERROR) {
+    // Ask the phone to make it current and send back where we left off
+    s_book_id = book_id;
+    s_start = (Pos){0, 0};
+    s_history_len = 0;
+    s_back_pending = false;
+    s_chunk_total = -1;
+    s_at_end = false;
+    reset_cache();
+    cancel_request();
+    s_status[0] = '\0';
+    s_state = STATE_LOADING;
+    s_awaiting_open = true;
+    s_open_retries = 0;
+    s_pos_pending = false;
+    s_select_pending = true;
+    flush_control();
+    if (s_open_timer) app_timer_cancel(s_open_timer);
+    s_open_timer = app_timer_register(REQUEST_TIMEOUT_MS, open_timeout_callback, NULL);
+  }
+  window_stack_push(s_window, true);
 }
 
 static void init(void) {
@@ -639,22 +793,31 @@ static void init(void) {
   app_message_register_inbox_received(inbox_received_callback);
   app_message_register_inbox_dropped(inbox_dropped_callback);
   app_message_register_outbox_failed(outbox_failed_callback);
+  app_message_register_outbox_sent(outbox_sent_callback);
   app_message_open(INBOX_SIZE, OUTBOX_SIZE);
 
   s_window = window_create();
   window_set_click_config_provider(s_window, click_config_provider);
   window_set_window_handlers(s_window, (WindowHandlers) {
     .load = window_load,
+    .disappear = window_disappear,
     .unload = window_unload,
   });
-  window_stack_push(s_window, true);
+
+  // Open straight into the book; Back goes to the library underneath
+  library_menu_init();
+  library_menu_push(false);
+  window_stack_push(s_window, false);
 }
 
 static void deinit(void) {
   save_position();
   if (s_timeout_timer) app_timer_cancel(s_timeout_timer);
   if (s_pump_timer) app_timer_cancel(s_pump_timer);
+  if (s_open_timer) app_timer_cancel(s_open_timer);
+  if (s_control_timer) app_timer_cancel(s_control_timer);
   window_destroy(s_window);
+  library_menu_deinit();
 }
 
 int main(void) {

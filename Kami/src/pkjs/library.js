@@ -113,7 +113,37 @@ function putText(lib, id, text) {
   save(lib);
 }
 
+// Reading position per book: {chunk, offset, total}. The sample book's is
+// kept on the library itself.
+function getPosition(lib, id) {
+  if (id === SAMPLE_ID) return lib.samplePos || null;
+  var book = find(lib, id);
+  return book && book.pos ? book.pos : null;
+}
+
+function setPosition(lib, id, chunk, offset, total) {
+  var pos = { chunk: chunk, offset: offset, total: total };
+  if (id === SAMPLE_ID) {
+    lib.samplePos = pos;
+  } else {
+    var book = find(lib, id);
+    if (!book) return;
+    book.pos = pos;
+  }
+  save(lib);
+}
+
+// Whole-number percent read, or -1 if never opened.
+function percentRead(lib, id) {
+  var pos = getPosition(lib, id);
+  if (!pos || !(pos.total > 0)) return -1;
+  return Math.min(100, Math.floor(pos.chunk * 100 / pos.total));
+}
+
 module.exports = {
+  getPosition: getPosition,
+  setPosition: setPosition,
+  percentRead: percentRead,
   SAMPLE_ID: SAMPLE_ID,
   load: load,
   save: save,

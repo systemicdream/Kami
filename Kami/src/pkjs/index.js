@@ -1,6 +1,6 @@
 /**
  * Kami - PebbleKit JS
- * Milestone 3: Book import
+ * Milestone 4: Library menu
  *
  * Downloads plain-text books (Project Gutenberg links work best), keeps a
  * library in localStorage, and serves the current book to the watch in
@@ -21,6 +21,13 @@ var CMD_GET_LIBRARY = 2;
 var CMD_LIBRARY = 3;
 var CMD_OPEN_BOOK = 4;
 var CMD_STATUS = 5;
+var CMD_SELECT_BOOK = 6;  // watch -> phone: book picked in the library menu
+var CMD_SAVE_POS = 7;     // watch -> phone: reading position in a book
+
+// The watch's AppMessage inbox is 2048 bytes; keep the library list under this
+var LIBRARY_BYTES = 1700;
+var LIBRARY_TITLE_CHARS = 40;
+var LIBRARY_MAX_BOOKS = 32;  // MAX_BOOKS in library_menu.c
 
 // Max UTF-8 bytes per chunk. The watch buffers CHUNK_MAX (1600) bytes and
 // its AppMessage inbox is 2048 bytes, so leave headroom for the dictionary.
@@ -33,6 +40,7 @@ var CONFIG_URL = 'https://systemicdream.github.io/Kami/config/';
 var RUN_STORAGE_TEST = false;
 
 var DOWNLOAD_TIMEOUT_MS = 60000;
+var PROGRESS_INTERVAL_MS = 1500;
 
 // ---- Messaging -------------------------------------------------------------
 
@@ -63,8 +71,54 @@ function sendStatus(message) {
   send({ 'KEY_CMD': CMD_STATUS, 'KEY_CHUNK_DATA': message });
 }
 
-function sendOpenBook(id, total) {
-  send({ 'KEY_CMD': CMD_OPEN_BOOK, 'KEY_BOOK_ID': id, 'KEY_CHUNK_TOTAL': total });
+// Switch the watch to a book, including where it was left (if known).
+// show: bring the reader to the front on the watch (the book was picked in
+// Settings, so the watch may be showing the library menu).
+function sendOpenBook(id, total, show) {
+  var pos = library.getPosition(library.load(), id);
+  var dict = { 'KEY_CMD': CMD_OPEN_BOOK, 'KEY_BOOK_ID': id, 'KEY_CHUNK_TOTAL': total };
+  if (show) dict.KEY_SHOW = 1;
+  if (pos) {
+    dict.KEY_CHUNK_INDEX = pos.chunk;
+    dict.KEY_OFFSET = pos.offset;
+  }
+  send(dict);
+}
+
+// Library list for the watch menu: one "id\tpercent\ttitle" line per book,
+// most recently opened first. The sample book is listed only when the
+// library is empty.
+function sendLibrary() {
+  var lib = library.load();
+  var books = lib.books.slice().sort(function(a, b) { return b.opened - a.opened; });
+  var lines = [];
+  var bytes = 0;
+  if (!books.length) {
+    lines.push(library.SAMPLE_ID + '\t' + library.percentRead(lib, library.SAMPLE_ID) + '\tSample book');
+  }
+  for (var i = 0; i < books.length; i++) {
+    var b = books[i];
+    var title = (b.title || 'Not downloaded yet').replace(/[\t\n]/g, ' ');
+    if (title.length > LIBRARY_TITLE_CHARS) title = title.substring(0, LIBRARY_TITLE_CHARS - 3) + '...';
+    var line = b.id + '\t' + library.percentRead(lib, b.id) + '\t' + title;
+    var lineBytes = unescape(encodeURIComponent(line)).length + 1;
+    if (bytes + lineBytes > LIBRARY_BYTES || lines.length >= LIBRARY_MAX_BOOKS) break;
+    lines.push(line);
+    bytes += lineBytes;
+  }
+  send({ 'KEY_CMD': CMD_LIBRARY, 'KEY_BOOK_ID': lib.current, 'KEY_LIBRARY_DATA': lines.join('\n') });
+}
+
+function handleSelectBook(id) {
+  var lib = library.load();
+  if (!library.setCurrent(lib, id)) {
+    console.log('Watch picked unknown book ' + id);
+    sendOpenBook(lib.current, -1);
+    return;
+  }
+  console.log('Watch opened book ' + id);
+  var book = loadChunks(lib, id);
+  sendOpenBook(id, book ? book.chunks.length : -1);
 }
 
 // ---- Loaded book ------------------------------------------------------------
@@ -95,8 +149,6 @@ function loadChunks(lib, id) {
     }
   }
   loaded = { id: id, chunks: text.chunkText(prepared, CHUNK_BYTES) };
-  console.log('Loaded book ' + id + ': ' + prepared.length + ' chars, ' + loaded.chunks.length +
-              ' chunks, starts "' + prepared.substring(0, 60).replace(/\n/g, ' ') + '"');
   return loaded;
 }
 
@@ -145,32 +197,48 @@ function download(lib, book) {
   sendStatus('Downloading ' + bookLabel(book) + '...');
   console.log('Downloading book ' + book.id + ' from ' + book.url);
 
+  // A big book takes a while from the mirror, so show how much has arrived
+  var label = bookLabel(book);
+  var lastUpdate = 0;
+  var progress = function(bytes) {
+    var now = Date.now();
+    if (now - lastUpdate < PROGRESS_INTERVAL_MS) return;
+    lastUpdate = now;
+    sendStatus('Downloading ' + label + '... ' + Math.round(bytes / 1024) + ' KB');
+  };
+
   fetchFirst(text.downloadCandidates(book.url), 0, null, function(body) {
     onDownloaded(book.id, body);
   }, function(reason) {
     onDownloadFailed(book.id, reason);
-  });
+  }, progress);
 }
 
 // Try each URL in turn until one returns text.
-function fetchFirst(urls, i, lastError, done, fail) {
+function fetchFirst(urls, i, lastError, done, fail, progress) {
   if (i >= urls.length) {
     fail(lastError || 'no URL');
     return;
   }
   var next = function(reason) {
     console.log('Download from ' + urls[i] + ' failed: ' + reason);
-    fetchFirst(urls, i + 1, reason, done, fail);
+    fetchFirst(urls, i + 1, reason, done, fail, progress);
   };
   var xhr = new XMLHttpRequest();
   xhr.open('GET', urls[i], true);
   xhr.timeout = DOWNLOAD_TIMEOUT_MS;
+  // Gutenberg's mirror sends text/plain without a charset, which some
+  // clients read as Latin-1. Books are UTF-8.
+  if (xhr.overrideMimeType) xhr.overrideMimeType('text/plain; charset=utf-8');
   xhr.onload = function() {
-    if (xhr.status >= 200 && xhr.status < 300 && xhr.responseText) done(xhr.responseText);
+    if (xhr.status >= 200 && xhr.status < 300 && xhr.responseText) done(text.repairUtf8(xhr.responseText));
     else next('HTTP ' + xhr.status);
   };
   xhr.onerror = function() { next('network error'); };
   xhr.ontimeout = function() { next('timed out'); };
+  xhr.onprogress = function(e) {
+    if (progress && xhr.status >= 200 && xhr.status < 300 && e.loaded) progress(e.loaded);
+  };
   xhr.send();
 }
 
@@ -254,7 +322,7 @@ function applyChanges(changes) {
   }
 
   var cur = loadChunks(lib, target);
-  sendOpenBook(target, cur ? cur.chunks.length : -1);
+  sendOpenBook(target, cur ? cur.chunks.length : -1, true);
   if (!cur) {
     // Start downloading now; the watch's chunk request will be answered when done
     pending = { book: target, chunk: 0 };
@@ -278,22 +346,22 @@ function handleConfigResult(action) {
     if (added.existing) {
       console.log('Book ' + book.id + ' already in library, opening it');
       var have = loadChunks(lib, book.id);
-      sendOpenBook(book.id, have ? have.chunks.length : -1);
+      sendOpenBook(book.id, have ? have.chunks.length : -1, true);
       return;
     }
     console.log('Added book ' + book.id + ': ' + url);
-    sendOpenBook(book.id, -1);  // watch will ask for chunk 0, which downloads it
+    sendOpenBook(book.id, -1, true);  // watch will ask for chunk 0, which downloads it
     pending = { book: book.id, chunk: 0 };
     download(lib, book);
   } else if (action.open !== undefined) {
     if (!library.setCurrent(lib, action.open)) return;
     var cur = loadChunks(lib, action.open);
-    sendOpenBook(action.open, cur ? cur.chunks.length : -1);
+    sendOpenBook(action.open, cur ? cur.chunks.length : -1, true);
   } else if (action.remove !== undefined) {
     library.remove(lib, action.remove);
     if (loaded && loaded.id === action.remove) loaded = null;
     var next = loadChunks(lib, lib.current);
-    sendOpenBook(lib.current, next ? next.chunks.length : -1);
+    sendOpenBook(lib.current, next ? next.chunks.length : -1, true);
   }
 }
 
@@ -318,20 +386,21 @@ Pebble.addEventListener('appmessage', function(e) {
   if (cmd === CMD_GET_CHUNK) {
     handleChunkRequest(dict.KEY_BOOK_ID || 0, dict.KEY_CHUNK_INDEX || 0);
   } else if (cmd === CMD_GET_LIBRARY) {
-    // TODO (milestone 4): send library list
+    sendLibrary();
+  } else if (cmd === CMD_SELECT_BOOK) {
+    handleSelectBook(dict.KEY_BOOK_ID || 0);
+  } else if (cmd === CMD_SAVE_POS) {
+    var lib = library.load();
+    library.setPosition(lib, dict.KEY_BOOK_ID || 0, dict.KEY_CHUNK_INDEX || 0,
+                        dict.KEY_OFFSET || 0, dict.KEY_CHUNK_TOTAL || 0);
   }
 });
 
 Pebble.addEventListener('showConfiguration', function() {
-  var lib = library.load();
-  console.log('Opening settings. Library: current=' + lib.current + ' ' + lib.books.map(function(b) {
-    return b.id + ':' + (b.title || '?') + (b.cached ? '(cached)' : '');
-  }).join(', '));
   Pebble.openURL(configUrl());
 });
 
 Pebble.addEventListener('webviewclosed', function(e) {
-  console.log('Settings closed, response: ' + (e && e.response ? e.response : '(none)'));
   if (!e || !e.response) return;  // closed without choosing anything
   var action;
   try {
